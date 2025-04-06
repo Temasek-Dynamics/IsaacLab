@@ -33,6 +33,19 @@ ISAAC_NUCLEUS_DIR = f"{NUCLEUS_ASSET_ROOT_DIR}/Isaac"
 ISAACLAB_NUCLEUS_DIR = f"{ISAAC_NUCLEUS_DIR}/IsaacLab"
 """Path to the ``Isaac/IsaacLab`` directory on the NVIDIA Nucleus Server."""
 
+ISAACLAB_ASSET_ROOT_DIR = os.path.realpath(os.path.join(os.path.dirname(__file__), "../../../../../omni.isaac.lab_assets"))
+"""Path to the root directory of the Isaac Lab Assets."""
+
+print(ISAACLAB_ASSET_ROOT_DIR)
+
+LOCAL_DATA_DIR = f"{ISAACLAB_ASSET_ROOT_DIR}/data"
+"""Path to the local data directory."""
+
+LOCAL_ROBOT_DIR = f"{LOCAL_DATA_DIR}/Robots"
+"""Path to the local robot directory."""
+
+LOCAL_OBJECT_DIR = f"{LOCAL_DATA_DIR}/Objects"
+"""Path to the local object directory."""
 
 def check_file_path(path: str) -> Literal[0, 1, 2]:
     """Checks if a file exists on the Nucleus Server or locally.
