@@ -15,6 +15,7 @@ from omni.isaac.lab.envs import DirectRLEnv, DirectRLEnvCfg
 from omni.isaac.lab.envs.ui import BaseEnvWindow
 from omni.isaac.lab.markers import VisualizationMarkers
 from omni.isaac.lab.scene import InteractiveSceneCfg
+from omni.isaac.lab.sensors import ContactSensor, ContactSensorCfg
 from omni.isaac.lab.sim import SimulationCfg
 from omni.isaac.lab.terrains import TerrainImporterCfg
 from omni.isaac.lab.utils import configclass
@@ -88,30 +89,56 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     )
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=2.5, replicate_physics=True)
+    space_length = 5.0
+    space_width = 5.0
+    space_height = 3.0
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=max(space_length, space_width), replicate_physics=True)
 
     # robot
     robot: ArticulationCfg = RAYNOR_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    thrust_to_weight = 2.5
-    moment_scale = 0.5
-    v_max = 1.0
+    robot_length = 0.14
+    robot_width = 0.14
+    robot_height = 0.08
     
     # rectanglular gate
     rectanglular_gate: RigidObjectCfg = RECTANGLE_GATE_CFG.replace(prim_path="/World/envs/env_.*/Gate")
+    gate_width = 0.4
+    gate_height = 0.3
+    contact_sensor = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Gate/body",
+        filter_prim_paths_expr = ["/World/envs/env_.*/Robot/body",
+                                  "/World/envs/env_.*/Robot/rotor0",
+                                  "/World/envs/env_.*/Robot/rotor1",
+                                  "/World/envs/env_.*/Robot/rotor2",
+                                  "/World/envs/env_.*/Robot/rotor3",
+                                  "/World/envs/env_.*/Robot/camera"],
+        history_length=3,
+        debug_vis=True,
+    )
+    
+    # constraints
+    thrust_to_weight = 2.5
+    moment_scale = 0.5
+    v_max = 1.0
+    t_max = 5.0 # max time for traversing the gate
 
     # reward factors
     alpha = 1.0 # sensitivity of the reward for approaching the gate
-    beta = 1.0 # sensitivity of the reward for traversing the gate
-    gamma = 1.0 # sensitivity of the reward for reaching the goal
+    beta = 5.0 # sensitivity of the reward for traversing the gate
+    gamma = 5.0 # sensitivity of the reward for reaching the goal
     
     # penalty factors
-    lambda_jerk = 0.1 # penalty for jerk
-    lambda_accel = 0.1 # penalty for acceleration
-    lambda_velocity = 0.1 # penalty for velocity
+    lambda_collision = 0.1 # penalty for collision with the gate
+    lambda_time = 0.1 # penalty for time
+    lambda_died = 5.0 # penalty for dying
+    # lambda_jerk = 0.1 # penalty for jerk
+    # lambda_accel = 0.1 # penalty for acceleration
+    # lambda_velocity = 0.1 # penalty for velocity
     
     # traversal length
-    traversal_length = 0.25 # length of the traversal
-    traversal_width = 0.1 # width of the traversal
+    traversal_length = 2 * robot_length # length of the traversal
+    traversal_width = gate_width - robot_width # width of the traversal
+    traversal_height = gate_height - robot_height # height of the traversal
 
 
 class RaynorEnv(DirectRLEnv):
@@ -127,6 +154,10 @@ class RaynorEnv(DirectRLEnv):
         self._moment = torch.zeros(self.num_envs, 1, 3, device=self.device)
         # Goal position
         self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # Traversing status
+        self._traversed = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._died = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
         # Logging
         self._episode_sums = {
@@ -135,6 +166,9 @@ class RaynorEnv(DirectRLEnv):
                 "approaching",
                 "traversing",
                 "reaching",
+                "collision",
+                "time",
+                "died",
                 # "aggressive_motion",
             ]
         }
@@ -151,11 +185,13 @@ class RaynorEnv(DirectRLEnv):
         # Add robot to the scene
         self._robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self._robot
-        
         # Add rectanglular gate to the scene
         self._gate = RigidObject(self.cfg.rectanglular_gate)
         self.scene.rigid_objects["gate"] = self._gate
-
+        # Add contact sensor to the scene
+        self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
+        self.scene.sensors["contact_sensor"] = self._contact_sensor
+        # Add terrain to the scene
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
@@ -194,29 +230,57 @@ class RaynorEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        # reward for approaching 
+        # Pre-computation
+        gate_points_pos_b = self.get_gate_points_pos(relative_to_robot=True) # shape: (N, 4, 3)
+        gate_center = torch.mean(gate_points_pos_b, dim=1) # shape: (N, 3)
+        x_proj, y_proj, z_proj = self.project_robot_pos(gate_points_pos_b) # shape: (N, 3)
         last_gate_center = torch.mean(self._gate_points_pos_b, dim=1) # shape: (N, 3)
-        gate_center = torch.mean(self.get_gate_points_pos(relative_to_robot=True), dim=1) # shape: (N, 3)
-        normal_gate = self.get_gate_normal() # shape: (N, 3)
-        x_proj = torch.sum(-gate_center * normal_gate, dim=1) # shape: N
-        reward_approaching = self.cfg.alpha * (torch.linalg.norm(last_gate_center, dim=1) - torch.linalg.norm(gate_center, dim=1))
-        mask = (x_proj >= -self.cfg.traversal_length)
-        reward_approaching[mask] = 0.0
-        
-        # reward for traversing
-        last_x_proj = torch.sum(-last_gate_center * normal_gate, dim=1) # shape: N
-        y_proj = torch.linalg.norm(gate_center + x_proj.unsqueeze(-1) * normal_gate, dim=1) # shape: N
-        reward_traversing = self.cfg.beta * (x_proj - last_x_proj)
-        mask = (torch.abs(x_proj) > self.cfg.traversal_length) | (y_proj > self.cfg.traversal_width)
-        reward_traversing[mask] = 0.0
-        
-        # reward for reaching the goal
+        last_normal_gate = self.get_gate_normal(self._gate_points_pos_b) # shape: (N, 3)
+        last_x_proj = torch.sum(-last_gate_center * last_normal_gate, dim=1) # shape: N
         last_goal_pos = self._desired_pos_b
         goal_pos = self._desired_pos_w - self._robot.data.root_pos_w
+        
+        # check traversing status
+        is_traversing = self.is_traversing_gate(x_proj, last_x_proj, gate_points_pos_b, self._gate_points_pos_b) # check if the robot has traversed the gate
+        first_traversing = is_traversing & (~self._traversed) # mask for first time traversing
+        other_traversing = is_traversing & self._traversed # mask for traversing after the first time
+        
+        # reward for traversing
+        is_traversing = self.is_traversing_gate(x_proj, last_x_proj, gate_points_pos_b, self._gate_points_pos_b) # check if the robot has traversed the gate
+        reward_traversing = self.cfg.beta * ((x_proj - last_x_proj) + is_traversing.float())
+        mask = (torch.abs(x_proj) > self.cfg.traversal_length) | (torch.abs(y_proj) >= self.cfg.traversal_width / 2) | (torch.abs(z_proj) >= self.cfg.traversal_height / 2) | (self._traversed) # TODO: self._traversed will disable the reset traversing reward
+        # # alternative reward for traversing
+        # reward_traversing = self.cfg.beta * ((x_proj - last_x_proj) + first_traversing.float() - self.cfg.traversal_length * other_traversing.float()) # reward first traversing and penalize other traversing
+        # mask = (torch.abs(x_proj) > self.cfg.traversal_length) | (torch.abs(y_proj) >= self.cfg.traversal_width / 2) | (torch.abs(z_proj) >= self.cfg.traversal_height / 2)
+        reward_traversing[mask] = 0.0
+        self._traversed = torch.logical_or(self._traversed, is_traversing) # update the traversed status
+        
+        # reward for approaching 
+        reward_approaching = self.cfg.alpha * (torch.linalg.norm(last_gate_center, dim=1) - torch.linalg.norm(gate_center, dim=1))
+        mask = (x_proj >= -self.cfg.traversal_length) | (self._traversed)
+        reward_approaching[mask] = 0.0
+        
+        # reward for reaching the goal
         reward_reaching = self.cfg.gamma * (torch.linalg.norm(last_goal_pos, dim=1) - torch.linalg.norm(goal_pos, dim=1))
-        mask = (x_proj <= self.cfg.traversal_length)
+        mask = (x_proj <= self.cfg.traversal_length) | (~self._traversed)
         reward_reaching[mask] = 0.0
         
+        # penalty for collision with the gate
+        contact_force = torch.linalg.norm(self._contact_sensor.data.net_forces_w, dim=2).squeeze() # shape: (N,)
+        penalty_collision = -self.cfg.lambda_collision * torch.ones_like(contact_force)
+        mask = (contact_force < 1e-3) # ignore small contact force
+        penalty_collision[mask] = 0.0
+        
+        # penalty for over time
+        t_now = self.episode_length_buf / self.max_episode_length * self.cfg.episode_length_s
+        penalty_time = -self.cfg.lambda_time * (t_now - self.cfg.t_max)
+        mask = (t_now <= self.cfg.t_max) | (self._traversed)
+        penalty_time[mask] = 0.0
+        
+        # penalty for dying
+        penalty_died = -self.cfg.lambda_died * torch.ones_like(self._died, dtype=torch.float)
+        mask = (~self._died) | (self._traversed)
+        penalty_died[mask] = 0.0
         
         # # penalty for aggressive motion
         # penalty_jerk = self.cfg.lambda_jerk * torch.sum(
@@ -234,6 +298,9 @@ class RaynorEnv(DirectRLEnv):
             "approaching": reward_approaching,
             "traversing": reward_traversing,
             "reaching": reward_reaching,
+            "collision": penalty_collision,
+            "time": penalty_time,
+            "died": penalty_died,
             # "aggressive_motion": -penalty_aggressive_motion,
         }
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
@@ -244,10 +311,13 @@ class RaynorEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        died = torch.logical_or(self._robot.data.root_pos_w[:, 2] < 0.1, self._robot.data.root_pos_w[:, 2] > 3.0)
-        gate_move = torch.linalg.norm(self._gate.data.root_lin_vel_w, dim=1) > 0.5
-        died = torch.logical_or(died, gate_move)
-        return died, time_out
+        # Check if the robot has exceeded the space limits
+        robot_pos = self._robot.data.root_pos_w - self._terrain.env_origins
+        over_length = torch.logical_or(robot_pos[:, 0] < -0.1, robot_pos[:, 0] > self.cfg.space_length)
+        over_width = torch.logical_or(robot_pos[:, 1] < -self.cfg.space_width / 2.0, robot_pos[:, 1] > self.cfg.space_width / 2.0)
+        over_height = torch.logical_or(robot_pos[:, 2] < 0.1, robot_pos[:, 2] > self.cfg.space_height)
+        self._died = over_height | over_length | over_width
+        return self._died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None or len(env_ids) == self.num_envs:
@@ -272,16 +342,21 @@ class RaynorEnv(DirectRLEnv):
 
         self._robot.reset(env_ids)
         self._gate.reset(env_ids)
+        self._contact_sensor.reset(env_ids)
         super()._reset_idx(env_ids)
         if len(env_ids) == self.num_envs:
             # Spread out the resets to avoid spikes in training when many environments reset at a similar time
             self.episode_length_buf = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
 
+        # Reset the status
         self._actions[env_ids] = 0.0
+        self._traversed[env_ids] = False
+        self._died[env_ids] = False
+        
         # Sample new commands
-        self._desired_pos_w[env_ids, 0] = torch.zeros_like(self._desired_pos_w[env_ids, 0]).uniform_(2.0, 3.0)
-        self._desired_pos_w[env_ids, 1] = torch.zeros_like(self._desired_pos_w[env_ids, 1]).uniform_(-1.0, 1.0)
-        self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]).uniform_(0.5, 1.5)
+        self._desired_pos_w[env_ids, 0] = torch.zeros_like(self._desired_pos_w[env_ids, 0]).uniform_(2.5, 3.0)
+        self._desired_pos_w[env_ids, 1] = torch.zeros_like(self._desired_pos_w[env_ids, 1]).uniform_(-0.5, 0.5)
+        self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]).uniform_(0.5, 1.0)
         self._desired_pos_w[env_ids, :3] += self._terrain.env_origins[env_ids, :3]
         # Reset robot state
         joint_pos = self._robot.data.default_joint_pos[env_ids]
@@ -294,7 +369,7 @@ class RaynorEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         # Reset gate state
         default_gate_state = self._gate.data.default_root_state[env_ids]
-        default_gate_state[:, 0] = torch.zeros_like(default_gate_state[:, 0]).uniform_(0.5, 1.5) # x-axis position
+        default_gate_state[:, 0] = torch.zeros_like(default_gate_state[:, 0]).uniform_(1.0, 2.0) # x-axis position
         default_gate_state[:, 1] = torch.zeros_like(default_gate_state[:, 1]).uniform_(-1.0, 1.0) # y-axis position
         default_gate_state[:, 2] = torch.zeros_like(default_gate_state[:, 2]).uniform_(0.5, 1.5) # z-axis position
         default_gate_state[:, :3] += self._terrain.env_origins[env_ids, :3]
@@ -333,10 +408,12 @@ class RaynorEnv(DirectRLEnv):
         gate_quat_w = self._gate.data.root_quat_w.squeeze()
         
         # Hardcoded the diagonal points of the gate
-        top_left_pos_b = torch.tensor([0.0, -0.2, 0.15], device=self.device)
-        top_right_pos_b = torch.tensor([0.0, 0.2, 0.15], device=self.device)
-        bottom_left_pos_b = torch.tensor([0.0, -0.2, -0.15], device=self.device)
-        bottom_right_pos_b = torch.tensor([0.0, 0.2, -0.15], device=self.device)
+        half_width = self.cfg.gate_width / 2.0
+        half_height = self.cfg.gate_height / 2.0
+        top_left_pos_b = torch.tensor([0.0, -half_width, half_height], device=self.device)
+        top_right_pos_b = torch.tensor([0.0, half_width, half_height], device=self.device)
+        bottom_left_pos_b = torch.tensor([0.0, -half_width, -half_height], device=self.device)
+        bottom_right_pos_b = torch.tensor([0.0, half_width, -half_height], device=self.device)
         points_pos_b = torch.stack([top_left_pos_b, top_right_pos_b, bottom_left_pos_b, bottom_right_pos_b])
         
         # Get the world positions of the diagonal points
@@ -358,12 +435,12 @@ class RaynorEnv(DirectRLEnv):
         else:
             return torch.stack([top_left_pos_w, top_right_pos_w, bottom_left_pos_w, bottom_right_pos_w], dim=1)
 
-    def get_gate_normal(self) -> torch.Tensor:
+    def get_gate_normal(self, gate_points_pos, full_basis = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get the normal vector of the gate plane."""
         # Get the diagonal points of the gate
-        top_left_pos = self._gate_points_pos_b[:, 0]
-        top_right_pos = self._gate_points_pos_b[:, 1]
-        bottom_left_pos = self._gate_points_pos_b[:, 2]
+        top_left_pos = gate_points_pos[:, 0]
+        top_right_pos = gate_points_pos[:, 1]
+        bottom_left_pos = gate_points_pos[:, 2]
         
         # Get the basis vectors of the gate
         basis_0 = bottom_left_pos - top_left_pos
@@ -377,19 +454,56 @@ class RaynorEnv(DirectRLEnv):
         normal = torch.linalg.cross(basis_0, basis_1)
         normal /= torch.linalg.norm(normal, dim=1, keepdim=True)
         
-        return normal
+        if full_basis:
+            return normal, basis_0, basis_1
+        else:
+            return normal
 
-    def get_projected_robot_pos(self) -> torch.Tensor:
+    def project_robot_pos(self, gate_points_pos) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get the projected robot position on the gate plane."""
         # Get the vector from the gate to the robot
-        robot_pos_w = self._robot.data.root_pos_w
-        gate_pos_w = self._gate.data.root_pos_w
-        gate2robot = robot_pos_w - gate_pos_w
+        gate2robot = -torch.mean(gate_points_pos, dim=1) # shape: (N, 3)
         
-        # Get the normal vector of the gate plane
-        normal = self.get_gate_normal()
+        # Get the normal vector and basis of the gate plane
+        normal_gate, basis_0, basis_1 = self.get_gate_normal(gate_points_pos, full_basis=True)
         
         # Project the robot position on the gate plane
-        robot_pos_projected = robot_pos_w - torch.sum(gate2robot * normal, dim=1, keepdim=True) * normal
+        x = torch.sum(gate2robot * normal_gate, dim=1) # shape: (N,)
+        y = torch.sum(gate2robot * basis_0, dim=1) # shape: (N,)
+        z = torch.sum(gate2robot * basis_1, dim=1) # shape: (N,)
         
-        return robot_pos_projected
+        return x, y, z
+    
+    def is_traversing_gate(self, x_proj: torch.Tensor, last_x_proj: torch.Tensor, gate_points_pos: torch.Tensor, last_gate_points_pos: torch.Tensor) -> torch.Tensor:
+        """Check if the robot is traversing the gate in the current step."""
+        # Check if the robot has crossed the gate plane
+        has_crossed = (x_proj > 0.0) & (last_x_proj < 0.0) # shape: (N,)
+        if has_crossed.sum() == 0:
+            return has_crossed
+
+        # Linear interpolation
+        alpha = x_proj[has_crossed] / (x_proj[has_crossed] - last_x_proj[has_crossed] + 1e-6)
+        mid_gate_points_pos = alpha.view(-1, 1, 1) * last_gate_points_pos[has_crossed] + (1 - alpha).view(-1, 1, 1) * gate_points_pos[has_crossed]
+        
+        # Check if the robot is inside the gate plane
+        _, y, z = self.project_robot_pos(mid_gate_points_pos)
+        is_inside = (torch.abs(y) < self.cfg.gate_width / 2.0) & (torch.abs(z) < self.cfg.gate_height / 2.0)
+        
+        # Check if the robot is traversing the gate
+        is_traversing = torch.zeros_like(has_crossed)
+        is_traversing[has_crossed] = is_inside
+        
+        return is_traversing
+    
+    def is_reaching_goal(self) -> torch.Tensor:
+        """Check if the robot is reaching the goal."""
+        # TODO
+        # Get the robot position
+        robot_pos = self._robot.data.root_pos_w - self._terrain.env_origins
+        
+        # Check if the robot is reaching the goal
+        x_reach = torch.logical_and(robot_pos[:, 0] >= self.cfg.space_length, robot_pos[:, 0] <= self.cfg.space_length + 0.5)
+        y_reach = torch.logical_and(robot_pos[:, 1] >= -self.cfg.space_width / 2.0, robot_pos[:, 1] <= self.cfg.space_width / 2.0)
+        z_reach = torch.logical_and(robot_pos[:, 2] >= 0.5, robot_pos[:, 2] <= self.cfg.space_height)
+        
+        return x_reach & y_reach & z_reach

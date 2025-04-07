@@ -83,7 +83,7 @@ mindmap
 
 ### Penalty
 
-The penalty for traversing the gate can be mainly divided into three components:
+The penalty for traversing the gate can be mainly divided into four components:
 
 <center>
 
@@ -92,19 +92,21 @@ mindmap
     root((Penalty))
         Collision
         Agressive Motion
-        Timeout
+        Over Time
+        Died
 ```
 
 </center>
 
-* **Collision**: The agent is penalized for colliding with the gate.
+* **Collision**: The agent is penalized for **colliding** with the gate.
 * **Agressive Motion**: The agent is penalized for moving aggressively, which is defined as a large change in acceleration and too large velocity.
-* **Timeout**: The agent is penalized for taking too long to traverse the gate.
+* **Over Time**: The agent is penalized for taking **more time than expected** to traverse the gate.
+* **Died**: The agent is penalized for **dying** in the simulation.
 
 ### Reward Function
 
 $$
-R = R_{approaching} + R_{traversing} + R_{reaching} - P_{collision} - P_{aggressive} - P_{timeout}
+R = R_{approaching} + R_{traversing} + R_{reaching} + P_{collision} + P_{aggressive} + P_{timeout} + P_{died} \\
 $$
 
 ## Reward Design
@@ -114,7 +116,7 @@ $$
 The closer the drone is to the gate's center, the bigger the reward will be. The reward is defined as:
 
 $$
-R_{approaching} = \alpha * \left[ x_{proj}^k < -l_{traverse} \right] * (\left| \mathbf{g}_{center}^{k-1} \right| - \left| \mathbf{g}_{center}^k \right|) \\
+R_{approaching} = \alpha * \left[ x_{proj}^k < -l_{traverse} \And \text{not traversed} \right] * (\left| \mathbf{g}_{center}^{k-1} \right| - \left| \mathbf{g}_{center}^k \right|) \\
 x_{proj}^k = \mathbf{n}_{gate} \cdot (- \mathbf{g}_{center}^k) \\
 \mathbf{n}_{gate} = \frac{\left( \mathbf{g}_{1} - \mathbf{g}_{0} \right) \times \left( \mathbf{g}_{2} - \mathbf{g}_{0} \right)}{\left| \left( \mathbf{g}_{1} - \mathbf{g}_{0} \right) \times \left( \mathbf{g}_{2} - \mathbf{g}_{0} \right)  \right|} \quad
 \mathbf{g}_{center} = \frac{\mathbf{g}_{0} + \mathbf{g}_{1} + \mathbf{g}_{2} + \mathbf{g}_{3}}{4}
@@ -128,11 +130,15 @@ $$
 The more the drone move forward when reaching the gate, the bigger the reward will be. The reward is defined as:
 
 $$
-R_{traversing} = \beta * \left[ |x_{proj}^k| \leq l_{traverse} \And y_{proj}^k \leq w_{traverse} \right] * (x_{proj}^k - x_{proj}^{k-1}) \\
-y_{proj}^k = |\mathbf{g}_{center}^k + x_{proj}^k * \mathbf{n}_{gate}|
+R_{traversing} = \beta * \left[ |x_{proj}^k| \leq l_{traverse} \And |y_{proj}^k| < \frac{w_{traverse}}{2} \And |z_{proj}^k| < \frac{h_{traverse}}{2} \And \text{not traversed}  \right] * (x_{proj}^k - x_{proj}^{k-1} + [\text{traversing}]) \\
+y_{proj}^k = \mathbf{n}_{y} \cdot (- \mathbf{g}_{center}^k) \\
+z_{proj}^k = \mathbf{n}_{z} \cdot (- \mathbf{g}_{center}^k) \\
+\text{Alternatively} \\
+R_{traversing} = \beta * \left[ |x_{proj}^k| \leq l_{traverse} \And |y_{proj}^k| < \frac{w_{traverse}}{2} \And |z_{proj}^k| < \frac{h_{traverse}}{2} \right] * (x_{proj}^k - x_{proj}^{k-1} + [\text{first time traversing}] - l_{traverse} * [\text{other traversing}])
 $$
 
 * $\beta$: scaling factor for the reward.
+* $h_{traverse}$: traversing height of the gate.
 * $w_{traverse}$: traversing width of the gate.
 
 !!!note Note
@@ -143,14 +149,51 @@ $$
 After passing through the gate, the drone is rewarded for reaching the goal position. The reward is defined as:
 
 $$
-R_{reaching} = \gamma * \left[ x_{proj}^k > l_{traverse} \right] * \left[ \left| \mathbf{p}_{goal}^{k-1} \right| - \left| \mathbf{p}_{goal}^k \right| \right] \\
+R_{reaching} = \gamma * \left[ x_{proj}^k > l_{traverse} \And \text{traversed}  \right] * \left[ \left| \mathbf{p}_{goal}^{k-1} \right| - \left| \mathbf{p}_{goal}^k \right| \right] \\
 $$
 
 * $\gamma$: scaling factor for the reward.
 
+### Traversing Check
+
+To reward or not depending on the traversing status, we need to check if the drone has passed through the gate. The traversing status can be checked by the following conditions:
+
+$$
+\text{crossed} = (x_{proj}^k > 0 \And x_{proj}^{k-1} < 0) \\
+\text{inside} = (|y_{proj}^k| < \frac{w_{gate}}{2} \And |z_{proj}^k| < \frac{h_{gate}}{2}) \\
+\text{traversing} = \text{crossed} \And \text{inside} \\
+\text{first time traversing} = \left[ \text{traversing} \And \text{not traversed} \right] \\
+\text{other traversing} = \left[ \text{traversing} \And \text{traversed} \right] \\
+\text{traversed} = \left[ \text{traversing} | \text{traversed} \right] \\
+$$
+
 ## Penalty Design
 
+### Collision
+
+The drone is penalized for colliding with the gate. The penalty is defined as:
+
+$$
+P_{collision} = -\lambda_{collision} * [\text{collision}] \\
+\text{collision} := (F_{contact} > 0) \\
+$$
+
+* $\lambda_{collision}$: scaling factor for the penalty.
+* $F_{contact}$: contact force between the drone and the gate.
+
+### Timeout
+
+The drone is penalized with time going on if it takes too much time. The penalty is defined as:
+
+$$
+P_{timeout} = -\lambda_{timeout} * \left[ t > t_{max} \And \text{not traversed} \right] * (t - t_{max}) \\
+$$
+
+* $\lambda_{timeout}$: scaling factor for the penalty.
+* $t_{max}$: expected maximum time for traversing the gate.
+
 ### Aggressive Motion
+<!-- TODO -->
 
 The drone is penalized for moving aggressively, which is defined as a large change in acceleration and too large velocity. The penalty is defined as:
 
@@ -160,3 +203,15 @@ P_{jerk} = \lambda_{jerk} \frac{\left| \mathbf{a}_k - \mathbf{a}_{k-1} \right|}{
 P_{acceleration} = \lambda_{acceleration} \left| \mathbf{a}_k \right| \\
 P_{velocity} = \left[ \left| \bold{v}_{drone} \right| > v_{max} \right] * (e^{\lambda_{velocity} ( \left| \bold{v}_{drone} \right| - v_{max})} - 1) \\
 $$
+
+### Died
+
+The drone is defined as **died** if it is out of the simulation boundary. The penalty is defined as:
+
+$$
+P_{died} = -\lambda_{died} * [\text{died} \And \text{not traversed}] \\
+\text{died} := \left[ \bold{p}_{drone} \notin \text{boundary} \right] \\
+$$
+
+* $\lambda_{died}$: scaling factor for the penalty.
+* $\text{boundary}$: assumed to be a cube including the gate and the goal.

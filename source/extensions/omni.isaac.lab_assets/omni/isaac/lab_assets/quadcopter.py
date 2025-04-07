@@ -68,6 +68,7 @@ RAYNOR_CFG = ArticulationCfg(
             enabled_self_collisions=False,
         ),
         copy_from_source=False,
+        activate_contact_sensors=True,
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 0.5),

@@ -19,6 +19,7 @@ RECTANGLE_GATE_CFG = RigidObjectCfg(
             max_depenetration_velocity=10.0,
         ),
         copy_from_source=False,
+        activate_contact_sensors=True,
     ),
     init_state=RigidObjectCfg.InitialStateCfg(
         pos=(1.0, 0.0, 0.5),
