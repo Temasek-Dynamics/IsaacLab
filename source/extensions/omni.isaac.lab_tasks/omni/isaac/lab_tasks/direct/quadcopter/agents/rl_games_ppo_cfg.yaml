@@ -35,9 +35,15 @@ params:
       regularizer:
         name: l2_regularizer
         scale: 1e-5 # regularization scale
-
+  
+  # Two stages training
+  # stage_1:
   load_checkpoint: False # flag which sets whether to load the checkpoint
-  load_path: '' # path to the checkpoint to load
+  load_path: ''
+  # # stage_2:
+  # # make sure keep_traversing = False in EnvCfg
+  # load_checkpoint: True # flag which sets whether to load the checkpoint
+  # load_path: '~/.local/share/ov/pkg/IsaacLab-1.4.1/logs/rl_games/quadcopter_direct/best/nn/quadcopter_direct.pth' # path to the checkpoint to load
 
   config:
     name: quadcopter_direct

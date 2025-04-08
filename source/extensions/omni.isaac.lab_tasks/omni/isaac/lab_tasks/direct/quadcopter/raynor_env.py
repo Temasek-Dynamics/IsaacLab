@@ -61,6 +61,7 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     state_space = 0
     debug_vis = True
     sim_dt = 1/100
+    keep_traversing = False
 
     ui_window_class_type = RaynorEnvWindow
 
@@ -126,7 +127,7 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     y_moment_scale = 0.5 # moment scale for y-axis
     z_moment_scale = 0.5 # moment scale for z-axis
     v_max = 1.0 # max velocity of the robot
-    t_max = 5.0 # max time for traversing the gate
+    t_max = 5.0 if not keep_traversing else episode_length_s # max time for traversing the gate
 
     # reward factors
     alpha = 1.0 # sensitivity of the reward for approaching the gate
@@ -227,6 +228,13 @@ class RaynorEnv(DirectRLEnv):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
+        if self.cfg.keep_traversing:
+            is_reaching = self.is_reaching_goal(self._desired_pos_b)
+            mask = (~self._collided) & is_reaching
+            # mask = is_reaching
+            env_ids = torch.nonzero(mask, as_tuple=False).view(-1)
+            self.move_gate_and_goal(env_ids) # move the gate and goal to another position after traversing
+        
         last_gate_points_pos_b = self._gate_points_pos_b.clone()
         self._gate_points_pos_b = self.get_gate_points_pos(relative_to_robot=True) # shape: (N, 4, 3)
         self._desired_pos_b = self._desired_pos_w - self._robot.data.root_pos_w # shape: (N, 3)
@@ -332,10 +340,13 @@ class RaynorEnv(DirectRLEnv):
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         # Check if the robot has exceeded the space limits
         robot_pos = self._robot.data.root_pos_w - self._terrain.env_origins
-        over_length = torch.logical_or(robot_pos[:, 0] < -0.1, robot_pos[:, 0] > self.cfg.space_length)
-        over_width = torch.logical_or(robot_pos[:, 1] < -self.cfg.space_width / 2.0, robot_pos[:, 1] > self.cfg.space_width / 2.0)
         over_height = torch.logical_or(robot_pos[:, 2] < 0.1, robot_pos[:, 2] > self.cfg.space_height)
-        self._died = over_height | over_length | over_width
+        if not self.cfg.keep_traversing:
+            over_length = torch.logical_or(robot_pos[:, 0] < -0.1, robot_pos[:, 0] > self.cfg.space_length)
+            over_width = torch.logical_or(robot_pos[:, 1] < -self.cfg.space_width / 2.0, robot_pos[:, 1] > self.cfg.space_width / 2.0)
+            self._died = over_height | over_length | over_width
+        else:
+            self._died = over_height
         return self._died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -374,11 +385,12 @@ class RaynorEnv(DirectRLEnv):
         self._died[env_ids] = False
         self._collided[env_ids] = False
         
-        # Sample new commands
+        # Sample new goal
         self._desired_pos_w[env_ids, 0] = torch.zeros_like(self._desired_pos_w[env_ids, 0]).uniform_(2.5, 3.0)
         self._desired_pos_w[env_ids, 1] = torch.zeros_like(self._desired_pos_w[env_ids, 1]).uniform_(-0.5, 0.5)
         self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]).uniform_(0.5, 1.0)
         self._desired_pos_w[env_ids, :3] += self._terrain.env_origins[env_ids, :3]
+        self._desired_pos_b = self._desired_pos_w - self._robot.data.root_pos_w # shape: (N, 3)
         # Reset robot state
         joint_pos = self._robot.data.default_joint_pos[env_ids]
         joint_vel = self._robot.data.default_joint_vel[env_ids]
@@ -558,3 +570,44 @@ class RaynorEnv(DirectRLEnv):
             #   True     False   (0.0, 1.0, 0.0) # green
             #   True     True    (0.0, 1.0, 1.0) # cyan
             shader.GetInput("diffuse_reflection_color").Set(color)
+    
+    def move_gate_and_goal(self, env_ids: torch.Tensor | None):
+        """Move the gate and goal to another position."""
+        if env_ids is None or env_ids.shape[0] == self.num_envs:
+            env_ids = self._robot._ALL_INDICES
+        elif env_ids.shape[0] == 0:
+            return
+            
+        # Get the current state
+        robot_state = self._robot.data.root_state_w[env_ids]
+        gate_state = self._gate.data.root_state_w[env_ids]
+        goal_pos = self._desired_pos_w[env_ids]
+        
+        # Move the gate in front of the robot
+        gate_state[:, 0] = torch.zeros_like(gate_state[:, 0]).uniform_(1.0, 2.0)
+        gate_state[:, 1] = torch.zeros_like(gate_state[:, 1]).uniform_(-1.0, 1.0)
+        gate_state[:, 2] = torch.zeros_like(gate_state[:, 2]).uniform_(0.5, 1.5)
+        gate_state[:, :2] += goal_pos[:, :2]
+        
+        # new random orientation and velocity
+        gate_state[:, 3:7] = quat_from_euler_xyz(
+            roll=torch.zeros_like(gate_state[:, 4]).uniform_(-torch.pi/2, torch.pi/2), 
+            pitch=torch.zeros_like(gate_state[:, 5]),
+            yaw=torch.zeros_like(gate_state[:, 6]))
+        gate_state[:, 8] = torch.zeros_like(gate_state[:, 8]).uniform_(-0.5, 0.5)
+        gate_state[:, 10] = torch.zeros_like(gate_state[:, 10]).uniform_(-torch.pi/2, torch.pi/2)
+        
+        # Set the new state of the gate
+        self._traversed[env_ids] = False
+        self._collided[env_ids] = False
+        self._gate_points_pos_b[env_ids] = self.get_gate_points_pos(gate_state=gate_state, robot_state=robot_state, relative_to_robot=True)
+        self._gate.write_root_pose_to_sim(gate_state[:, :7], env_ids)
+        self._gate.write_root_velocity_to_sim(gate_state[:, 7:], env_ids)
+        
+        # Set the new goal position
+        goal_pos[:, 0] = torch.zeros_like(goal_pos[:, 0]).uniform_(2.5, 3.0)
+        goal_pos[:, 1] = torch.zeros_like(goal_pos[:, 1]).uniform_(-0.5, 0.5)
+        goal_pos[:, 2] = torch.zeros_like(goal_pos[:, 2]).uniform_(0.5, 1.0)
+        goal_pos[:, :2] += robot_state[:, :2]
+        self._desired_pos_w[env_ids] = goal_pos
+        
