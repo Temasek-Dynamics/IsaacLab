@@ -8,7 +8,9 @@ from __future__ import annotations
 import gymnasium as gym
 import torch
 import math
+from pxr import UsdShade
 
+import omni.usd
 import omni.isaac.lab.sim as sim_utils
 from omni.isaac.lab.assets import Articulation, ArticulationCfg
 from omni.isaac.lab.assets import RigidObject, RigidObjectCfg
@@ -100,6 +102,7 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     robot_length = 0.15
     robot_width = 0.15
     robot_height = 0.1
+    rotor_force_max = 2.0
     
     # rectanglular gate
     rectanglular_gate: RigidObjectCfg = RECTANGLE_GATE_CFG.replace(prim_path="/World/envs/env_.*/Gate")
@@ -119,7 +122,9 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     
     # constraints
     thrust_to_weight = 2.5
-    moment_scale = 0.5
+    x_moment_scale = 0.5 # moment scale for x-axis
+    y_moment_scale = 0.5 # moment scale for y-axis
+    z_moment_scale = 0.5 # moment scale for z-axis
     v_max = 1.0 # max velocity of the robot
     t_max = 5.0 # max time for traversing the gate
 
@@ -163,6 +168,7 @@ class RaynorEnv(DirectRLEnv):
         # Traversing status
         self._traversed = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._died = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._collided = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
         # Logging
         self._episode_sums = {
@@ -213,7 +219,9 @@ class RaynorEnv(DirectRLEnv):
         desired_thrust = self._actions[:, 0]
         desired_moment = self._actions[:, 1:]
         self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (desired_thrust + 1.0) / 2.0
-        self._moment[:, 0, :] = self.cfg.moment_scale * desired_moment
+        self._moment[:, 0, 0] = self.cfg.x_moment_scale * desired_moment[:, 0]
+        self._moment[:, 0, 1] = self.cfg.y_moment_scale * desired_moment[:, 1]
+        self._moment[:, 0, 2] = self.cfg.z_moment_scale * desired_moment[:, 2]
 
     def _apply_action(self):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
@@ -275,8 +283,10 @@ class RaynorEnv(DirectRLEnv):
         # penalty for collision with the gate
         contact_force = torch.linalg.norm(self._contact_sensor.data.net_forces_w, dim=2).squeeze() # shape: (N,)
         penalty_collision = -self.cfg.lambda_collision * torch.ones_like(contact_force)
-        mask = (contact_force == 0)
+        colliding = (contact_force > 0.0)
+        mask = ~colliding
         penalty_collision[mask] = 0.0
+        self._collided = torch.logical_or(self._collided, colliding)
         
         # penalty for over time
         t_now = self.episode_length_buf / self.max_episode_length * self.cfg.episode_length_s
@@ -362,6 +372,7 @@ class RaynorEnv(DirectRLEnv):
         self._actions[env_ids] = 0.0
         self._traversed[env_ids] = False
         self._died[env_ids] = False
+        self._collided[env_ids] = False
         
         # Sample new commands
         self._desired_pos_w[env_ids, 0] = torch.zeros_like(self._desired_pos_w[env_ids, 0]).uniform_(2.5, 3.0)
@@ -412,6 +423,8 @@ class RaynorEnv(DirectRLEnv):
     def _debug_vis_callback(self, event):
         # update the markers
         self.goal_pos_visualizer.visualize(self._desired_pos_w)
+        # update the gate color
+        self.update_gate_color()
         
     def get_gate_points_pos(self, gate_state: torch.Tensor|None = None, robot_state: torch.Tensor|None = None, relative_to_robot: bool = False) -> torch.Tensor:
         """Get the diagonal points of the gate."""
@@ -525,3 +538,17 @@ class RaynorEnv(DirectRLEnv):
         threshold = math.sqrt(self.cfg.robot_length**2 + self.cfg.robot_width**2 + self.cfg.robot_height**2)
         is_reaching = self._traversed & (distance_to_goal < threshold) # traversed and close to the goal
         return is_reaching
+    
+    def update_gate_color(self):
+        """Update the color of the gate based on the traversing status."""
+        stage = omni.usd.get_context().get_stage()
+        gate_prim_paths = self._gate.root_physx_view.prim_paths
+        for i, gate_prim_paths in enumerate(gate_prim_paths):
+            # get the shader of the gate
+            shader_path = gate_prim_paths.replace("body", "Looks/OmniSurfaceLite/Shader")
+            shader_prim = stage.GetPrimAtPath(shader_path)
+            shader = UsdShade.Shader(shader_prim)
+            # green if traversed, red if not traversed
+            success = self._traversed[i].item() and not self._collided[i].item()
+            color = (0.0, 1.0, 0.0) if success else (1.0, 0.0, 0.0)
+            shader.GetInput("diffuse_reflection_color").Set(color)
