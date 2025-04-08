@@ -549,6 +549,12 @@ class RaynorEnv(DirectRLEnv):
             shader_prim = stage.GetPrimAtPath(shader_path)
             shader = UsdShade.Shader(shader_prim)
             # green if traversed, red if not traversed
-            success = self._traversed[i].item() and not self._collided[i].item()
-            color = (0.0, 1.0, 0.0) if success else (1.0, 0.0, 0.0)
+            traversed = self._traversed[i].item()
+            collided = self._collided[i].item()
+            color = (float(not traversed), float(traversed),float(collided))
+            # traversed collided    color
+            #   False    False   (1.0, 0.0, 0.0) # red
+            #   False    True    (1.0, 0.0, 1.0) # magenta
+            #   True     False   (0.0, 1.0, 0.0) # green
+            #   True     True    (0.0, 1.0, 1.0) # cyan
             shader.GetInput("diffuse_reflection_color").Set(color)
