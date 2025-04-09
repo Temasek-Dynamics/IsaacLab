@@ -55,7 +55,7 @@ class RaynorEnvWindow(BaseEnvWindow):
 class RaynorEnvCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 10.0
-    decimation = 2
+    decimation = 1
     action_space = 4
     observation_space = 41
     state_space = 0
@@ -68,7 +68,7 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     #   False               False    1 gate traversing
     #   False               True     1 ~ n gate traversing (not fully tested)
     #   True                False    n gate traversing
-    #   True                True     1 | n gate traversing
+    #   True                True     1 | n gate traversing (not fully tested)
     
     ui_window_class_type = RaynorEnvWindow
 
@@ -133,7 +133,7 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     x_moment_scale = 0.5 # moment scale for x-axis
     y_moment_scale = 0.5 # moment scale for y-axis
     z_moment_scale = 0.5 # moment scale for z-axis
-    v_max = 1.0 # max velocity of the robot
+    v_max = 3.0 # max velocity of the robot
     t_max = 5.0 # max time for one gate traversing
     reaching_threshold = math.sqrt(robot_length**2 + robot_width**2 + robot_height**2) # threshold for reaching the goal
 
@@ -146,10 +146,10 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     lambda_collision = 0.5 # penalty for collision with the gate
     lambda_time = 0.1 # penalty for time
     lambda_died = 5.0 # penalty for dying
-    lambda_jerk = 1e-3 # penalty for jerk
+    lambda_jerk = 5e-3 # penalty for jerk
     lambda_accel = 1e-3 # penalty for acceleration
-    lambda_velocity = 1e-4 # penalty for velocity
-    lambda_rotation = 1e-4 # penalty for rotation
+    lambda_velocity = 0.1 # penalty for velocity
+    lambda_rotation = 1e-3 # penalty for rotation
     
     # traversal length
     traversal_length = 2 * robot_length # length of the traversal
@@ -302,7 +302,7 @@ class RaynorEnv(DirectRLEnv):
         
         # reward for reaching the goal
         reward_reaching = self.cfg.gamma * (torch.linalg.norm(last_goal_pos, dim=1) - torch.linalg.norm(goal_pos, dim=1))
-        mask = (x_proj <= self.cfg.traversal_length) | (~self._traversed)
+        mask = ((x_proj <= self.cfg.traversal_length) | (~self._traversed)) & (~self._gate_moved)
         reward_reaching[mask] = 0.0
         
         # penalty for collision with the gate
@@ -362,11 +362,9 @@ class RaynorEnv(DirectRLEnv):
         over_height = torch.logical_or(robot_pos[:, 2] < 0.1, robot_pos[:, 2] > self.cfg.space_height)
         over_length = torch.logical_or(robot_pos[:, 0] < -0.1, robot_pos[:, 0] > self.cfg.space_length)
         over_width = torch.logical_or(robot_pos[:, 1] < -self.cfg.space_width / 2.0, robot_pos[:, 1] > self.cfg.space_width / 2.0)
-        self._died = over_height | over_length | over_width
-        
         # Only check the height for multi gate traversing
-        mask = self.cfg.keep_traversing | self.cfg.random_stop
-        self._died[mask] = over_height[mask]
+        self._died = over_height if (self.cfg.keep_traversing or self.cfg.random_stop) else (over_height | over_length | over_width)
+    
         return self._died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -406,8 +404,6 @@ class RaynorEnv(DirectRLEnv):
         self._collided[env_ids] = False
         self._gate_moved[env_ids] = False
         self._keep_traversing[env_ids] = self.cfg.keep_traversing | self.cfg.random_stop
-        self._stop_time[self._keep_traversing] = self.cfg.episode_length_s
-        self._stop_time[~self._keep_traversing] = 0.0
         
         if self.cfg.random_stop:
             mask = (torch.rand_like(self._keep_traversing[env_ids], dtype=torch.float) < 0.5)
@@ -415,11 +411,16 @@ class RaynorEnv(DirectRLEnv):
             if self.cfg.keep_traversing:
                 # same tasks are keep traversing, the other tasks are one gate traversing
                 self._keep_traversing[mask] = False
-                self._stop_time[mask] = 0.0
             else:
                 # randomly stop some traversing tasks
                 self._stop_time[mask] =  torch.zeros_like(self._stop_time[mask]).uniform_(0.0, 1.0) * (self.cfg.episode_length_s - self.cfg.t_max)
 
+        # Reset the stop time
+        episode_time = self.episode_length_buf[env_ids] / self.max_episode_length * self.cfg.episode_length_s # Get the episode starting time
+        self._stop_time[env_ids] = episode_time
+        mask = self._keep_traversing[env_ids]
+        self._stop_time[env_ids[mask]] = self.cfg.episode_length_s
+        
         # Sample new goal
         self._desired_pos_w[env_ids, 0] = torch.zeros_like(self._desired_pos_w[env_ids, 0]).uniform_(2.5, 3.0)
         self._desired_pos_w[env_ids, 1] = torch.zeros_like(self._desired_pos_w[env_ids, 1]).uniform_(-0.5, 0.5)
@@ -596,9 +597,10 @@ class RaynorEnv(DirectRLEnv):
             shader_prim = stage.GetPrimAtPath(shader_path)
             shader = UsdShade.Shader(shader_prim)
             # green if traversed, red if not traversed
+            moved = self._gate_moved[i].item()
             traversed = self._traversed[i].item()
             collided = self._collided[i].item()
-            color = (float(not traversed), float(traversed),float(collided))
+            color = (float(not traversed or moved), float(traversed),float(collided))
             # traversed collided    color
             #   False    False   (1.0, 0.0, 0.0) # red
             #   False    True    (1.0, 0.0, 1.0) # magenta
