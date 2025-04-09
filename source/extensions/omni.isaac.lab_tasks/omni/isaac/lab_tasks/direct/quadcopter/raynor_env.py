@@ -61,8 +61,14 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     state_space = 0
     debug_vis = True
     sim_dt = 1/100
-    keep_traversing = False
-
+    keep_traversing = True
+    mix_traversing = True # if True, there will be half keep_traversing and half not keep traversing when keep_traversing is True
+    # traversing task table
+    # keep_traversing   mix_traversing       task
+    #   False             False|True    one gate traversing
+    #   True                False       muli-gate traversing
+    #   True                True        1~n gate traversing
+    
     ui_window_class_type = RaynorEnvWindow
 
     # simulation
@@ -127,7 +133,8 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     y_moment_scale = 0.5 # moment scale for y-axis
     z_moment_scale = 0.5 # moment scale for z-axis
     v_max = 1.0 # max velocity of the robot
-    t_max = 5.0 if not keep_traversing else episode_length_s # max time for traversing the gate
+    t_max = 5.0 # max time for one gate traversing
+    reaching_threshold = math.sqrt(robot_length**2 + robot_width**2 + robot_height**2) # threshold for reaching the goal
 
     # reward factors
     alpha = 1.0 # sensitivity of the reward for approaching the gate
@@ -170,6 +177,8 @@ class RaynorEnv(DirectRLEnv):
         self._traversed = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._died = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._collided = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._gate_moved = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._keep_traversing = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
         # Logging
         self._episode_sums = {
@@ -223,18 +232,24 @@ class RaynorEnv(DirectRLEnv):
         self._moment[:, 0, 0] = self.cfg.x_moment_scale * desired_moment[:, 0]
         self._moment[:, 0, 1] = self.cfg.y_moment_scale * desired_moment[:, 1]
         self._moment[:, 0, 2] = self.cfg.z_moment_scale * desired_moment[:, 2]
+        
+        # reset the gate position if the robot has traversed the gate without collision
+        mask = self._traversed & (~self._collided) & (~self._gate_moved) & self._keep_traversing
+        env_ids = torch.nonzero(mask, as_tuple=False).view(-1)
+        self.move_gate(env_ids) # move the gate to another position after traversing
+        self._gate_moved[env_ids] = True
+        # reset the goal position if the robot reaches the goal without collision
+        is_reaching = self.is_reaching_goal(self._desired_pos_b)
+        mask = (~self._collided) & is_reaching & self._keep_traversing
+        env_ids = torch.nonzero(mask, as_tuple=False).view(-1)
+        self.move_goal(env_ids) # move the goal to another position after reaching
+        self._traversed[env_ids] = False
+        self._gate_moved[env_ids] = False
 
     def _apply_action(self):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
-        if self.cfg.keep_traversing:
-            is_reaching = self.is_reaching_goal(self._desired_pos_b)
-            mask = (~self._collided) & is_reaching
-            # mask = is_reaching
-            env_ids = torch.nonzero(mask, as_tuple=False).view(-1)
-            self.move_gate_and_goal(env_ids) # move the gate and goal to another position after traversing
-        
         last_gate_points_pos_b = self._gate_points_pos_b.clone()
         self._gate_points_pos_b = self.get_gate_points_pos(relative_to_robot=True) # shape: (N, 4, 3)
         self._desired_pos_b = self._desired_pos_w - self._robot.data.root_pos_w # shape: (N, 3)
@@ -272,7 +287,7 @@ class RaynorEnv(DirectRLEnv):
         # reward for traversing
         reward_traversing = self.cfg.beta * (x_proj - last_x_proj + is_traversing.float())
         mask = (torch.abs(x_proj) > self.cfg.traversal_length) | (torch.abs(y_proj) >= self.cfg.traversal_width / 2) | (torch.abs(z_proj) >= self.cfg.traversal_height / 2) | (self._traversed)
-        # # alternative reward for traversing (has issue)
+        # # alternative reward for traversing (not good)
         # reward_traversing = self.cfg.beta * ((x_proj - last_x_proj) + first_traversing.float() - self.cfg.traversal_length * other_traversing.float()) # reward first traversing and penalize other traversing
         # mask = (torch.abs(x_proj) > self.cfg.traversal_length) | (torch.abs(y_proj) >= self.cfg.traversal_width / 2) | (torch.abs(z_proj) >= self.cfg.traversal_height / 2)
         reward_traversing[mask] = 0.0
@@ -298,8 +313,10 @@ class RaynorEnv(DirectRLEnv):
         
         # penalty for over time
         t_now = self.episode_length_buf / self.max_episode_length * self.cfg.episode_length_s
-        penalty_time = -self.cfg.lambda_time * (t_now - self.cfg.t_max)
-        mask = (t_now <= self.cfg.t_max) | (self._traversed)
+        t_max = torch.ones_like(t_now) * self.cfg.t_max
+        t_max[self._keep_traversing] = self.cfg.episode_length_s
+        penalty_time = -self.cfg.lambda_time * (t_now - t_max)
+        mask = (t_now <= t_max) | (self._traversed)
         penalty_time[mask] = 0.0
         
         # penalty for dying
@@ -341,12 +358,12 @@ class RaynorEnv(DirectRLEnv):
         # Check if the robot has exceeded the space limits
         robot_pos = self._robot.data.root_pos_w - self._terrain.env_origins
         over_height = torch.logical_or(robot_pos[:, 2] < 0.1, robot_pos[:, 2] > self.cfg.space_height)
-        if not self.cfg.keep_traversing:
-            over_length = torch.logical_or(robot_pos[:, 0] < -0.1, robot_pos[:, 0] > self.cfg.space_length)
-            over_width = torch.logical_or(robot_pos[:, 1] < -self.cfg.space_width / 2.0, robot_pos[:, 1] > self.cfg.space_width / 2.0)
-            self._died = over_height | over_length | over_width
-        else:
-            self._died = over_height
+        over_length = torch.logical_or(robot_pos[:, 0] < -0.1, robot_pos[:, 0] > self.cfg.space_length)
+        over_width = torch.logical_or(robot_pos[:, 1] < -self.cfg.space_width / 2.0, robot_pos[:, 1] > self.cfg.space_width / 2.0)
+        
+        # Only check the height for multi-gate traversing
+        self._died = over_height | over_length | over_width
+        self._died[self._keep_traversing] = over_height[self._keep_traversing]
         return self._died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -384,6 +401,11 @@ class RaynorEnv(DirectRLEnv):
         self._traversed[env_ids] = False
         self._died[env_ids] = False
         self._collided[env_ids] = False
+        self._gate_moved[env_ids] = False
+        self._keep_traversing[env_ids] = self.cfg.keep_traversing
+        if self.cfg.mix_traversing:
+            rand_mask = (torch.rand_like(self._keep_traversing[env_ids], dtype=torch.float) < 0.5)
+            self._keep_traversing[env_ids[rand_mask]] = False
         
         # Sample new goal
         self._desired_pos_w[env_ids, 0] = torch.zeros_like(self._desired_pos_w[env_ids, 0]).uniform_(2.5, 3.0)
@@ -547,8 +569,8 @@ class RaynorEnv(DirectRLEnv):
     def is_reaching_goal(self, goal_pos) -> torch.Tensor:
         """Check if the robot is reaching the goal."""
         distance_to_goal = torch.linalg.norm(goal_pos, dim=1)
-        threshold = math.sqrt(self.cfg.robot_length**2 + self.cfg.robot_width**2 + self.cfg.robot_height**2)
-        is_reaching = self._traversed & (distance_to_goal < threshold) # traversed and close to the goal
+        reaching_threshold = (torch.ones_like(distance_to_goal) + self._keep_traversing.float()) * self.cfg.reaching_threshold
+        is_reaching = self._traversed & (distance_to_goal < reaching_threshold) # traversed and close to the goal
         return is_reaching
     
     def update_gate_color(self):
@@ -578,6 +600,19 @@ class RaynorEnv(DirectRLEnv):
         elif env_ids.shape[0] == 0:
             return
             
+        # move gate behind the goal
+        self.move_gate(env_ids)
+        
+        # move the goal
+        self.move_goal(env_ids)
+        
+    def move_gate(self, env_ids: torch.Tensor | None):
+        """Move the gate to another position based on the goal position."""
+        if env_ids is None or env_ids.shape[0] == self.num_envs:
+            env_ids = self._robot._ALL_INDICES
+        elif env_ids.shape[0] == 0:
+            return
+            
         # Get the current state
         robot_state = self._robot.data.root_state_w[env_ids]
         gate_state = self._gate.data.root_state_w[env_ids]
@@ -598,16 +633,26 @@ class RaynorEnv(DirectRLEnv):
         gate_state[:, 10] = torch.zeros_like(gate_state[:, 10]).uniform_(-torch.pi/2, torch.pi/2)
         
         # Set the new state of the gate
-        self._traversed[env_ids] = False
-        self._collided[env_ids] = False
         self._gate_points_pos_b[env_ids] = self.get_gate_points_pos(gate_state=gate_state, robot_state=robot_state, relative_to_robot=True)
         self._gate.write_root_pose_to_sim(gate_state[:, :7], env_ids)
         self._gate.write_root_velocity_to_sim(gate_state[:, 7:], env_ids)
         
-        # Set the new goal position
+    def move_goal(self, env_ids: torch.Tensor | None):
+        """Move the goal to another position based on current position."""
+        if env_ids is None or env_ids.shape[0] == self.num_envs:
+            env_ids = self._robot._ALL_INDICES
+        elif env_ids.shape[0] == 0:
+            return
+            
+        # Get the current state
+        goal_pos = self._desired_pos_w[env_ids]
+        
+        # Move the goal in front of the robot
+        last_goal_pos = goal_pos.clone()
         goal_pos[:, 0] = torch.zeros_like(goal_pos[:, 0]).uniform_(2.5, 3.0)
         goal_pos[:, 1] = torch.zeros_like(goal_pos[:, 1]).uniform_(-0.5, 0.5)
         goal_pos[:, 2] = torch.zeros_like(goal_pos[:, 2]).uniform_(0.5, 1.0)
-        goal_pos[:, :2] += robot_state[:, :2]
-        self._desired_pos_w[env_ids] = goal_pos
+        goal_pos[:, :2] += last_goal_pos[:, :2]
         
+        # Set the new state of the gate
+        self._desired_pos_w[env_ids] = goal_pos
