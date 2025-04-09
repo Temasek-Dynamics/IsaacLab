@@ -61,13 +61,14 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     state_space = 0
     debug_vis = True
     sim_dt = 1/100
-    keep_traversing = True
-    mix_traversing = True # if True, there will be half keep_traversing and half not keep traversing when keep_traversing is True
+    keep_traversing = False
+    random_stop = False # if True, robot will stop travering after traversing some gate
     # traversing task table
-    # keep_traversing   mix_traversing       task
-    #   False             False|True    one gate traversing
-    #   True                False       muli-gate traversing
-    #   True                True        1~n gate traversing
+    # keep_traversing    random_stop       task
+    #   False               False    1 gate traversing
+    #   False               True     1 ~ n gate traversing (not fully tested)
+    #   True                False    n gate traversing
+    #   True                True     1 | n gate traversing
     
     ui_window_class_type = RaynorEnvWindow
 
@@ -172,6 +173,7 @@ class RaynorEnv(DirectRLEnv):
         self._moment = torch.zeros(self.num_envs, 1, 3, device=self.device)
         # Goal position
         self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self._stop_time = torch.zeros(self.num_envs, device=self.device)
         
         # Traversing status
         self._traversed = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
@@ -313,8 +315,8 @@ class RaynorEnv(DirectRLEnv):
         
         # penalty for over time
         t_now = self.episode_length_buf / self.max_episode_length * self.cfg.episode_length_s
-        t_max = torch.ones_like(t_now) * self.cfg.t_max
-        t_max[self._keep_traversing] = self.cfg.episode_length_s
+        self._keep_traversing = (t_now < self._stop_time) # check if the robot is keep traversing
+        t_max = torch.ones_like(t_now) * self.cfg.t_max + self._stop_time
         penalty_time = -self.cfg.lambda_time * (t_now - t_max)
         mask = (t_now <= t_max) | (self._traversed)
         penalty_time[mask] = 0.0
@@ -360,10 +362,11 @@ class RaynorEnv(DirectRLEnv):
         over_height = torch.logical_or(robot_pos[:, 2] < 0.1, robot_pos[:, 2] > self.cfg.space_height)
         over_length = torch.logical_or(robot_pos[:, 0] < -0.1, robot_pos[:, 0] > self.cfg.space_length)
         over_width = torch.logical_or(robot_pos[:, 1] < -self.cfg.space_width / 2.0, robot_pos[:, 1] > self.cfg.space_width / 2.0)
-        
-        # Only check the height for multi-gate traversing
         self._died = over_height | over_length | over_width
-        self._died[self._keep_traversing] = over_height[self._keep_traversing]
+        
+        # Only check the height for multi gate traversing
+        mask = self.cfg.keep_traversing | self.cfg.random_stop
+        self._died[mask] = over_height[mask]
         return self._died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -402,11 +405,21 @@ class RaynorEnv(DirectRLEnv):
         self._died[env_ids] = False
         self._collided[env_ids] = False
         self._gate_moved[env_ids] = False
-        self._keep_traversing[env_ids] = self.cfg.keep_traversing
-        if self.cfg.mix_traversing:
-            rand_mask = (torch.rand_like(self._keep_traversing[env_ids], dtype=torch.float) < 0.5)
-            self._keep_traversing[env_ids[rand_mask]] = False
+        self._keep_traversing[env_ids] = self.cfg.keep_traversing | self.cfg.random_stop
+        self._stop_time[self._keep_traversing] = self.cfg.episode_length_s
+        self._stop_time[~self._keep_traversing] = 0.0
         
+        if self.cfg.random_stop:
+            mask = (torch.rand_like(self._keep_traversing[env_ids], dtype=torch.float) < 0.5)
+            mask = env_ids[mask]
+            if self.cfg.keep_traversing:
+                # same tasks are keep traversing, the other tasks are one gate traversing
+                self._keep_traversing[mask] = False
+                self._stop_time[mask] = 0.0
+            else:
+                # randomly stop some traversing tasks
+                self._stop_time[mask] =  torch.zeros_like(self._stop_time[mask]).uniform_(0.0, 1.0) * (self.cfg.episode_length_s - self.cfg.t_max)
+
         # Sample new goal
         self._desired_pos_w[env_ids, 0] = torch.zeros_like(self._desired_pos_w[env_ids, 0]).uniform_(2.5, 3.0)
         self._desired_pos_w[env_ids, 1] = torch.zeros_like(self._desired_pos_w[env_ids, 1]).uniform_(-0.5, 0.5)
