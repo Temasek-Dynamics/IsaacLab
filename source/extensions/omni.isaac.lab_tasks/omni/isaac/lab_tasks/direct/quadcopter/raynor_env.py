@@ -61,7 +61,7 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     state_space = 0
     debug_vis = True
     sim_dt = 1/100
-    keep_traversing = False
+    keep_traversing = True
     random_stop = False # if True, robot will stop travering after traversing some gate
     # traversing task table
     # keep_traversing    random_stop       task
@@ -195,6 +195,9 @@ class RaynorEnv(DirectRLEnv):
                 "aggressive",
             ]
         }
+        self.success_num = 0.0
+        self.partial_success_num = 0.0
+        self.total_num = 0.0
         # Get specific body indices
         self._body_id = self._robot.find_bodies("body")[0]
         self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
@@ -375,6 +378,22 @@ class RaynorEnv(DirectRLEnv):
         final_distance_to_goal = torch.linalg.norm(
             self._desired_pos_w[env_ids] - self._robot.data.root_pos_w[env_ids], dim=1
         ).mean()
+        if len(env_ids) != self.num_envs:
+            # for one gate traversing
+            success = self._traversed[env_ids] & (~self._collided[env_ids]) & (~self._keep_traversing[env_ids])
+            partial_success = self._traversed[env_ids] & (~self._keep_traversing[env_ids])
+            # for multi gate traversing
+            success = success | ((~self._died[env_ids]) & (~self._collided[env_ids]) & self._keep_traversing[env_ids])
+            partial_success = partial_success | ((~self._died[env_ids]) & self._keep_traversing[env_ids])
+            
+            self.success_num += torch.count_nonzero(success).item()
+            self.partial_success_num += torch.count_nonzero(partial_success).item()
+            self.total_num += len(env_ids)
+            success_rate = self.success_num / self.total_num
+            partial_success_rate = self.partial_success_num / self.total_num
+        else:
+            success_rate = 0.0
+            partial_success_rate = 0.0
         extras = dict()
         for key in self._episode_sums.keys():
             episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
@@ -386,7 +405,11 @@ class RaynorEnv(DirectRLEnv):
         extras["Episode_Termination/died"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
         extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
         extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
+        extras["Metrics/success_rate"] = success_rate
+        extras["Metrics/partial_success_rate"] = partial_success_rate
         self.extras["log"].update(extras)
+        
+        print(f"Success rate: {100*success_rate:.2f}%, Partial success rate: {100*partial_success_rate:.2f}%", end="\r")
 
         self._robot.reset(env_ids)
         self._gate.reset(env_ids)

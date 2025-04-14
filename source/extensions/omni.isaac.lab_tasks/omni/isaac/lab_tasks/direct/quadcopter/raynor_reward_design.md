@@ -6,52 +6,52 @@
 
 $$
 \text{observation} = \begin{bmatrix}
-    \bold{p}_{gate}^k \\
-    \bold{p}_{goal} \\
-    \bold{q}_{drone} \\
-    \bold{v}_{drone} \\
-    \bold{w}_{drone} \\
-    \bold{p}_{gate}^{k-1} \\
-    \bold{a}_{k-1} \\
+    \mathbf{p}_{gate}^k \\
+    \mathbf{p}_{goal} \\
+    \mathbf{q}_{drone} \\
+    \mathbf{v}_{drone} \\
+    \mathbf{w}_{drone} \\
+    \mathbf{p}_{gate}^{k-1} \\
+    \mathbf{a}_{k-1} \\
 \end{bmatrix} \quad
 \text{action} = \mathbf{a}_k = \begin{bmatrix}
-    \bold{F}_{drone} \\
-    \bold{M}_{drone} \\
+    \mathbf{F}_{drone} \\
+    \mathbf{M}_{drone} \\
 \end{bmatrix} \\
-\bold{v}_{drone} = \begin{bmatrix}
+\mathbf{v}_{drone} = \begin{bmatrix}
     v_{x} \\
     v_{y} \\
     v_{z}
 \end{bmatrix} \quad
-\bold{q}_{drone} = \begin{bmatrix}
+\mathbf{q}_{drone} = \begin{bmatrix}
     q_{x} \\
     q_{y} \\
     q_{z} \\
     q_{w}
 \end{bmatrix} \quad
-\bold{w}_{drone} = \begin{bmatrix}
+\mathbf{w}_{drone} = \begin{bmatrix}
     w_{x} \\
     w_{y} \\
     w_{z}
 \end{bmatrix} \\
-\bold{p}_{goal} = \begin{bmatrix}
+\mathbf{p}_{goal} = \begin{bmatrix}
     x_{goal} \\
     y_{goal} \\
     z_{goal}
 \end{bmatrix} \quad
-\bold{p}_{gate} = \begin{bmatrix}
-    \bold{g}_0 \\
-    \bold{g}_1 \\
-    \bold{g}_2 \\
-    \bold{g}_3 \\
+\mathbf{p}_{gate} = \begin{bmatrix}
+    \mathbf{g}_0 \\
+    \mathbf{g}_1 \\
+    \mathbf{g}_2 \\
+    \mathbf{g}_3 \\
 \end{bmatrix} \quad
-\bold{g}_i = \begin{bmatrix}
+\mathbf{g}_i = \begin{bmatrix}
     x_{i} \\
     y_{i} \\
     z_{i}
 \end{bmatrix} \quad \\
-\bold{F}_{drone} = F \quad
-\bold{M}_{drone} = \begin{bmatrix}
+\mathbf{F}_{drone} = F \quad
+\mathbf{M}_{drone} = \begin{bmatrix}
     M_{x} \\
     M_{y} \\
     M_{z}
@@ -194,7 +194,6 @@ $$
 * $t_{max}$: expected maximum time for traversing the gate.
 
 ### Aggressive Motion
-<!-- TODO -->
 
 The drone is penalized for moving aggressively, which is defined as a large change in acceleration and too large velocity. The penalty is defined as:
 
@@ -202,9 +201,9 @@ $$
 P_{aggressive} = P_{jerk} + P_{acceleration} + P_{velocity} + P_{rotation} \\
 P_{jerk} = -\lambda_{jerk} \left| \mathbf{a}_k - \mathbf{a}_{k-1} \right| \\
 P_{acceleration} = -\lambda_{acceleration} \left| \mathbf{a}_k \right| \\
-P_{velocity} = \left[ \left| \bold{v}_{drone} \right| > v_{max} \right] * (1 - e^{\lambda_{velocity} ( \left| \bold{v}_{drone} \right| - v_{max})}) \\
-P_{rotation} = \left[ \text{reaching}\right] * (1 - e^{\lambda_{rotation} \left| \bold{w}_{drone} \right|}) \\
-\text{reaching} = \left[ \left| \bold{p}_{goal} \right| < \sqrt{l_{drone}^2 + w_{drone}^2 + h_{drone}^2} \right] \And \text{traversed}  \\
+P_{velocity} = \left[ \left| \mathbf{v}_{drone} \right| > v_{max} \right] * (1 - e^{\lambda_{velocity} ( \left| \mathbf{v}_{drone} \right| - v_{max})}) \\
+P_{rotation} = \left[ \text{reaching}\right] * (1 - e^{\lambda_{rotation} \left| \mathbf{w}_{drone} \right|}) \\
+\text{reaching} = \left[ \left| \mathbf{p}_{goal} \right| < \sqrt{l_{drone}^2 + w_{drone}^2 + h_{drone}^2} \right] \And \text{traversed}  \\
 $$
 
 * $\lambda_{jerk}$: scaling factor for the jerk penalty.
@@ -222,7 +221,7 @@ The drone is defined as **died** if it is out of the simulation boundary. The pe
 
 $$
 P_{died} = -\lambda_{died} * [\text{died} \And \text{not traversed}] \\
-\text{died} := \left[ \bold{p}_{drone} \notin \text{boundary} \right] \\
+\text{died} := \left[ \mathbf{p}_{drone} \notin \text{boundary} \right] \\
 $$
 
 * $\lambda_{died}$: scaling factor for the penalty.
