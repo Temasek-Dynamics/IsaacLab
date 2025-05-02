@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
-import gymnasium as gym
-import torch
+import os
 import math
+import torch
+import imageio
+import gymnasium as gym
 from pxr import UsdShade
 
 import omni.usd
@@ -19,6 +21,8 @@ from omni.isaac.lab.envs.ui import BaseEnvWindow
 from omni.isaac.lab.markers import VisualizationMarkers
 from omni.isaac.lab.scene import InteractiveSceneCfg
 from omni.isaac.lab.sensors import ContactSensor, ContactSensorCfg
+from omni.isaac.lab.sensors import TiledCamera, TiledCameraCfg
+from omni.isaac.lab.sensors import Camera, CameraCfg
 from omni.isaac.lab.sim import SimulationCfg
 from omni.isaac.lab.terrains import TerrainImporterCfg
 from omni.isaac.lab.utils import configclass
@@ -100,8 +104,8 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     )
 
     # scene
-    space_length = 5.0
-    space_width = 5.0
+    space_length = 50.0
+    space_width = 50.0
     space_height = 3.0
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=max(space_length, space_width), replicate_physics=True)
 
@@ -112,10 +116,7 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     robot_height = 0.1
     rotor_force_max = 2.0
     
-    # rectanglular gate
-    rectanglular_gate: RigidObjectCfg = RECTANGLE_GATE_CFG.replace(prim_path="/World/envs/env_.*/Gate")
-    gate_width = 0.4
-    gate_height = 0.3
+    # sensors
     contact_sensor = ContactSensorCfg(
         prim_path="/World/envs/env_.*/Gate/body",
         filter_prim_paths_expr = ["/World/envs/env_.*/Robot/body",
@@ -123,10 +124,23 @@ class RaynorEnvCfg(DirectRLEnvCfg):
                                   "/World/envs/env_.*/Robot/rotor1",
                                   "/World/envs/env_.*/Robot/rotor2",
                                   "/World/envs/env_.*/Robot/rotor3",
-                                  "/World/envs/env_.*/Robot/camera"],
+                                  "/World/envs/env_.*/Robot/camera",
+                                  ],
         history_length=3,
         debug_vis=True,
     )
+    camera = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/Robot/camera/Depth",
+        data_types=["rgb", "depth"],
+        spawn=None,
+        width=256,
+        height=192,
+    )
+    
+    # rectanglular gate
+    rectanglular_gate: RigidObjectCfg = RECTANGLE_GATE_CFG.replace(prim_path="/World/envs/env_.*/Gate")
+    gate_width = 0.4
+    gate_height = 0.3
     
     # constraints
     thrust_to_weight = 2.5
@@ -217,6 +231,9 @@ class RaynorEnv(DirectRLEnv):
         # Add contact sensor to the scene
         self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         self.scene.sensors["contact_sensor"] = self._contact_sensor
+        # Add camera to the scene
+        self._camera = TiledCamera(self.cfg.camera)
+        self.scene.sensors["camera"] = self._camera
         # Add terrain to the scene
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -271,6 +288,7 @@ class RaynorEnv(DirectRLEnv):
             dim=-1,
         )
         observations = {"policy": obs}
+        self.record_camera()
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
@@ -298,7 +316,7 @@ class RaynorEnv(DirectRLEnv):
         reward_traversing[mask] = 0.0
         self._traversed = torch.logical_or(self._traversed, is_traversing) # update the traversed status
         
-        # reward for approaching 
+        # reward for approaching
         reward_approaching = self.cfg.alpha * (torch.linalg.norm(last_gate_center, dim=1) - torch.linalg.norm(gate_center, dim=1))
         mask = (x_proj >= -self.cfg.traversal_length) | (self._traversed)
         reward_approaching[mask] = 0.0
@@ -414,6 +432,7 @@ class RaynorEnv(DirectRLEnv):
         self._robot.reset(env_ids)
         self._gate.reset(env_ids)
         self._contact_sensor.reset(env_ids)
+        self._camera.reset(env_ids)
         super()._reset_idx(env_ids)
         if len(env_ids) == self.num_envs:
             # Spread out the resets to avoid spikes in training when many environments reset at a similar time
@@ -694,3 +713,57 @@ class RaynorEnv(DirectRLEnv):
         
         # Set the new state of the gate
         self._desired_pos_w[env_ids] = goal_pos
+
+    def record_camera(self):
+        # show side-by-side RGB and depth images
+        max_depth = 6.0
+        min_depth = 0.52
+
+        # fetch and tile RGB
+        rgb_images = self._camera.data.output["rgb"].clone()  # (N, H, W, 3)
+        N, H, W, C = rgb_images.shape
+        grid = int(math.sqrt(N))
+        assert grid * grid == N, f"env_num ({N}) is not a perfect square"
+        rgb_tiles = (
+            rgb_images
+            .view(grid, grid, H, W, C)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+            .view(grid * H, grid * W, C)
+        )
+
+        # fetch and tile depth
+        depth_images = self._camera.data.output["depth"].clone()  # (N, H, W) or (N, H, W, 1)
+        if depth_images.dim() == 3:
+            depth_images = depth_images.unsqueeze(-1)  # make (N, H, W, 1)
+        _, Hd, Wd, Cd = depth_images.shape
+        depth_tiles = (
+            depth_images
+            .view(grid, grid, Hd, Wd, Cd)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+            .view(grid * Hd, grid * Wd, Cd)
+        )
+        # clamp & normalize depth
+        depth_tiles = depth_tiles.clamp(min=min_depth, max=max_depth) / max_depth * 255
+        # convert to 3-channel for display
+        if depth_tiles.shape[2] == 1:
+            depth_tiles = depth_tiles.repeat(1, 1, 3)
+
+        # concatenate RGB (left) and depth (right)
+        frame_t = torch.cat([rgb_tiles, depth_tiles], dim=1)  # shape (grid*H, grid*W*2, 3)
+
+        # ensure output directory exists
+        out_dir = "/home/longbin/.local/share/ov/pkg/IsaacLab-1.4.1/logs/videos"
+        os.makedirs(out_dir, exist_ok=True)
+
+        # prepare the frame
+        frame = frame_t.cpu().numpy().astype("uint8")
+
+        # initialize writer on first call
+        if not hasattr(self, "video_writer"):
+            video_path = os.path.join(out_dir, "run.mp4")
+            self.video_writer = imageio.get_writer(video_path, fps=30, codec="libx264")
+
+        # append frame to video
+        self.video_writer.append_data(frame)
