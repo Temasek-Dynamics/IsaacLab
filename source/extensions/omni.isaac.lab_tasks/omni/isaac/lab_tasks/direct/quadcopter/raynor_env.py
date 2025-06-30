@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import os
+import csv
 import math
 import torch
 import imageio
 import gymnasium as gym
 from pxr import UsdShade
+from datetime import datetime
 
 import omni.usd
 import omni.isaac.lab.sim as sim_utils
@@ -65,6 +67,8 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     state_space = 0
     debug_vis = True
     sim_dt = 1/100
+    log_data = False
+    enable_camera = False
     keep_traversing = True
     random_stop = False # if True, robot will stop travering after traversing some gate
     # traversing task table
@@ -141,6 +145,27 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     rectanglular_gate: RigidObjectCfg = RECTANGLE_GATE_CFG.replace(prim_path="/World/envs/env_.*/Gate")
     gate_width = 0.4
     gate_height = 0.3
+    gate_range = {
+        "x": (1.0, 2.0),  # x position range of the gate
+        "y": (-1.0, 1.0),  # y position range of the gate
+        "z": (0.5, 1.5),  # z position range of the gate
+        "roll": (-torch.pi / 2.0, torch.pi / 2.0),  # roll angle range of the gate
+        "pitch": (0.0, 0.0),  # pitch angle range of the gate
+        "yaw": (0.0, 0.0),  # yaw angle range of the gate
+        "vx": (-0.5, 0.5),  # x velocity range of the gate
+        "vy": (0.0, 0.0),   # y velocity range of the gate
+        "vz": (0.0, 0.0),   # z velocity range of the gate
+        "omega_x": (-torch.pi / 2.0, torch.pi / 2.0),  # x angular velocity range of the gate
+        "omega_y": (0.0, 0.0),    # y angular velocity range of the gate
+        "omega_z": (0.0, 0.0),    # z angular velocity range of the gate
+    }
+    
+    # goal position
+    goal_range = {
+        "x": (2.5, 3.0),  # x position range of the goal
+        "y": (-0.5, 0.5),  # y position range of the goal
+        "z": (0.5, 1.0),  # z position range of the goal
+    }
     
     # constraints
     thrust_to_weight = 2.5
@@ -169,7 +194,9 @@ class RaynorEnvCfg(DirectRLEnvCfg):
     traversal_length = 2 * robot_length # length of the traversal
     traversal_width = gate_width - robot_width # width of the traversal
     traversal_height = gate_height - robot_height # height of the traversal
-
+    
+    # log directory for recording data
+    log_dir: str = "/home/longbin/.local/share/ov/pkg/IsaacLab-1.4.1/logs/raynor_env"
 
 class RaynorEnv(DirectRLEnv):
     cfg: RaynorEnvCfg
@@ -220,6 +247,20 @@ class RaynorEnv(DirectRLEnv):
 
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
+        
+        # data logging
+        log_dir = self.cfg.log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self._log_file = open(log_dir + datetime.now().strftime("/%Y-%m-%d_%H-%M-%S.csv"), "w", newline="")
+        self._log_writer = csv.writer(self._log_file)
+        self._log_writer.writerow([
+            "env_id", "step",
+            "x", "y", "z",
+            "vx", "vy", "vz",
+            # "ax", "ay", "az",
+            "thrust", "moment_x", "moment_y", "moment_z"
+        ])
+        self._log_step = 0
 
     def _setup_scene(self):
         # Add robot to the scene
@@ -232,8 +273,9 @@ class RaynorEnv(DirectRLEnv):
         self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         self.scene.sensors["contact_sensor"] = self._contact_sensor
         # Add camera to the scene
-        self._camera = TiledCamera(self.cfg.camera)
-        self.scene.sensors["camera"] = self._camera
+        if self.cfg.enable_camera:
+            self._camera = TiledCamera(self.cfg.camera)
+            self.scene.sensors["camera"] = self._camera
         # Add terrain to the scene
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -289,6 +331,7 @@ class RaynorEnv(DirectRLEnv):
         )
         observations = {"policy": obs}
         self.record_camera()
+        self.log_data()
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
@@ -432,7 +475,8 @@ class RaynorEnv(DirectRLEnv):
         self._robot.reset(env_ids)
         self._gate.reset(env_ids)
         self._contact_sensor.reset(env_ids)
-        self._camera.reset(env_ids)
+        if self.cfg.enable_camera:
+            self._camera.reset(env_ids)
         super()._reset_idx(env_ids)
         if len(env_ids) == self.num_envs:
             # Spread out the resets to avoid spikes in training when many environments reset at a similar time
@@ -464,9 +508,7 @@ class RaynorEnv(DirectRLEnv):
         self._stop_time[env_ids[mask]] = self.cfg.episode_length_s
         
         # Sample new goal
-        self._desired_pos_w[env_ids, 0] = torch.zeros_like(self._desired_pos_w[env_ids, 0]).uniform_(2.5, 3.0)
-        self._desired_pos_w[env_ids, 1] = torch.zeros_like(self._desired_pos_w[env_ids, 1]).uniform_(-0.5, 0.5)
-        self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]).uniform_(0.5, 1.0)
+        self._desired_pos_w[env_ids] = self._generate_goal_pos(env_ids) # shape: (N, 3)
         self._desired_pos_w[env_ids, :3] += self._terrain.env_origins[env_ids, :3]
         self._desired_pos_b = self._desired_pos_w - self._robot.data.root_pos_w # shape: (N, 3)
         # Reset robot state
@@ -479,16 +521,8 @@ class RaynorEnv(DirectRLEnv):
         self._robot.write_root_velocity_to_sim(default_robot_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         # Reset gate state
-        default_gate_state = self._gate.data.default_root_state[env_ids]
-        default_gate_state[:, 0] = torch.zeros_like(default_gate_state[:, 0]).uniform_(1.0, 2.0) # x-axis position
-        default_gate_state[:, 1] = torch.zeros_like(default_gate_state[:, 1]).uniform_(-1.0, 1.0) # y-axis position
-        default_gate_state[:, 2] = torch.zeros_like(default_gate_state[:, 2]).uniform_(0.5, 1.5) # z-axis position
+        default_gate_state = self._generate_gate_state(env_ids) # shape: (N, 13)
         default_gate_state[:, :3] += self._terrain.env_origins[env_ids, :3]
-        default_gate_state[:, 3:7] = quat_from_euler_xyz(   roll=torch.zeros_like(default_gate_state[:, 4]).uniform_(-torch.pi/2, torch.pi/2), 
-                                                            pitch=torch.zeros_like(default_gate_state[:, 5]),
-                                                            yaw=torch.zeros_like(default_gate_state[:, 6]))
-        default_gate_state[:, 8] = torch.zeros_like(default_gate_state[:, 8]).uniform_(-0.5, 0.5) # linear velocity of y-axis
-        default_gate_state[:, 10] = torch.zeros_like(default_gate_state[:, 10]).uniform_(-torch.pi/2, torch.pi/2) # angular velocity of x-axis
         self._gate.write_root_pose_to_sim(default_gate_state[:, :7], env_ids)
         self._gate.write_root_velocity_to_sim(default_gate_state[:, 7:], env_ids)
         
@@ -515,7 +549,44 @@ class RaynorEnv(DirectRLEnv):
         self.goal_pos_visualizer.visualize(self._desired_pos_w)
         # update the gate color
         self.update_gate_color()
+    
+    def _generate_gate_state(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Generate a random state for the gate."""
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self._robot._ALL_INDICES
         
+        gate_state = self._gate.data.default_root_state[env_ids]
+        # Randomize the gate position and orientation
+        gate_state[:, 0] = torch.zeros_like(gate_state[:, 0]).uniform_(*self.cfg.gate_range["x"])  # x position
+        gate_state[:, 1] = torch.zeros_like(gate_state[:, 1]).uniform_(*self.cfg.gate_range["y"])  # y position
+        gate_state[:, 2] = torch.zeros_like(gate_state[:, 2]).uniform_(*self.cfg.gate_range["z"])  # z position
+        gate_state[:, 3:7] = quat_from_euler_xyz(
+            roll=torch.zeros_like(gate_state[:, 4]).uniform_(*self.cfg.gate_range["roll"]),
+            pitch=torch.zeros_like(gate_state[:, 5]).uniform_(*self.cfg.gate_range["pitch"]),
+            yaw=torch.zeros_like(gate_state[:, 6]).uniform_(*self.cfg.gate_range["yaw"])
+        )  # quaternion rotation
+        gate_state[:, 7] = torch.zeros_like(gate_state[:, 7]).uniform_(*self.cfg.gate_range["vx"])  # linear velocity of x-axis
+        gate_state[:, 8] = torch.zeros_like(gate_state[:, 8]).uniform_(*self.cfg.gate_range["vy"])  # linear velocity of y-axis
+        gate_state[:, 9] = torch.zeros_like(gate_state[:, 9]).uniform_(*self.cfg.gate_range["vz"])  # linear velocity of z-axis
+        gate_state[:, 10] = torch.zeros_like(gate_state[:, 10]).uniform_(*self.cfg.gate_range["omega_x"])  # angular velocity of x-axis
+        gate_state[:, 11] = torch.zeros_like(gate_state[:, 11]).uniform_(*self.cfg.gate_range["omega_y"])  # angular velocity of y-axis
+        gate_state[:, 12] = torch.zeros_like(gate_state[:, 12]).uniform_(*self.cfg.gate_range["omega_z"])  # angular velocity of z-axis
+        
+        return gate_state # shape: (N, 13)
+    
+    def _generate_goal_pos(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Generate a random position for the goal."""
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self._robot._ALL_INDICES
+        
+        goal_pos = self._desired_pos_w[env_ids]
+        # Randomize the goal position
+        goal_pos[:, 0] = torch.zeros_like(goal_pos[:, 0]).uniform_(*self.cfg.goal_range["x"])  # x position
+        goal_pos[:, 1] = torch.zeros_like(goal_pos[:, 1]).uniform_(*self.cfg.goal_range["y"])  # y position
+        goal_pos[:, 2] = torch.zeros_like(goal_pos[:, 2]).uniform_(*self.cfg.goal_range["z"])  # z position
+        
+        return goal_pos # shape: (N, 3)
+    
     def get_gate_points_pos(self, gate_state: torch.Tensor|None = None, robot_state: torch.Tensor|None = None, relative_to_robot: bool = False) -> torch.Tensor:
         """Get the diagonal points of the gate."""
         
@@ -672,22 +743,11 @@ class RaynorEnv(DirectRLEnv):
             
         # Get the current state
         robot_state = self._robot.data.root_state_w[env_ids]
-        gate_state = self._gate.data.root_state_w[env_ids]
         goal_pos = self._desired_pos_w[env_ids]
         
-        # Move the gate in front of the robot
-        gate_state[:, 0] = torch.zeros_like(gate_state[:, 0]).uniform_(1.0, 2.0)
-        gate_state[:, 1] = torch.zeros_like(gate_state[:, 1]).uniform_(-1.0, 1.0)
-        gate_state[:, 2] = torch.zeros_like(gate_state[:, 2]).uniform_(0.5, 1.5)
+        # Move the gate in front of the robot and randomize it
+        gate_state = self._generate_gate_state(env_ids) # shape: (N, 13)
         gate_state[:, :2] += goal_pos[:, :2]
-        
-        # new random orientation and velocity
-        gate_state[:, 3:7] = quat_from_euler_xyz(
-            roll=torch.zeros_like(gate_state[:, 4]).uniform_(-torch.pi/2, torch.pi/2), 
-            pitch=torch.zeros_like(gate_state[:, 5]),
-            yaw=torch.zeros_like(gate_state[:, 6]))
-        gate_state[:, 8] = torch.zeros_like(gate_state[:, 8]).uniform_(-0.5, 0.5)
-        gate_state[:, 10] = torch.zeros_like(gate_state[:, 10]).uniform_(-torch.pi/2, torch.pi/2)
         
         # Set the new state of the gate
         self._gate_points_pos_b[env_ids] = self.get_gate_points_pos(gate_state=gate_state, robot_state=robot_state, relative_to_robot=True)
@@ -701,20 +761,21 @@ class RaynorEnv(DirectRLEnv):
         elif env_ids.shape[0] == 0:
             return
             
-        # Get the current state
-        goal_pos = self._desired_pos_w[env_ids]
+        # Store the current state
+        last_goal_pos = self._desired_pos_w[env_ids].clone() 
         
         # Move the goal in front of the robot
-        last_goal_pos = goal_pos.clone()
-        goal_pos[:, 0] = torch.zeros_like(goal_pos[:, 0]).uniform_(2.5, 3.0)
-        goal_pos[:, 1] = torch.zeros_like(goal_pos[:, 1]).uniform_(-0.5, 0.5)
-        goal_pos[:, 2] = torch.zeros_like(goal_pos[:, 2]).uniform_(0.5, 1.0)
+        goal_pos = self._generate_goal_pos(env_ids) # shape: (N, 3)
         goal_pos[:, :2] += last_goal_pos[:, :2]
         
         # Set the new state of the gate
         self._desired_pos_w[env_ids] = goal_pos
 
     def record_camera(self):
+        """Record the camera data and save it as a video."""
+        if not self.cfg.enable_camera:
+            return
+        
         # show side-by-side RGB and depth images
         max_depth = 6.0
         min_depth = 0.52
@@ -767,3 +828,31 @@ class RaynorEnv(DirectRLEnv):
 
         # append frame to video
         self.video_writer.append_data(frame)
+    
+    def log_data(self):
+        """Log the data to a CSV file."""
+        # Data logging
+        if self.cfg.log_data and self._log_file is not None:
+            for env_idx in range(self.num_envs):
+                self._log_writer.writerow([
+                    env_idx, self._log_step,
+                    self._robot.data.root_pos_w[env_idx, 0].item() - self._terrain.env_origins[env_idx, 0].item(),
+                    self._robot.data.root_pos_w[env_idx, 1].item() - self._terrain.env_origins[env_idx, 1].item(),
+                    self._robot.data.root_pos_w[env_idx, 2].item() - self._terrain.env_origins[env_idx, 2].item(),
+                    self._robot.data.root_lin_vel_b[env_idx, 0].item(),
+                    self._robot.data.root_lin_vel_b[env_idx, 1].item(),
+                    self._robot.data.root_lin_vel_b[env_idx, 2].item(),
+                    self._thrust[env_idx, 0, 2].item(),
+                    self._moment[env_idx, 0, 0].item(),
+                    self._moment[env_idx, 0, 1].item(),
+                    self._moment[env_idx, 0, 2].item(),
+                ])
+            self._log_step += 1
+    
+    def close(self):
+        """Close the csv writer"""
+        try:
+            self._log_file.close()
+        except Exception as e:
+            print(f"Error closing log file: {e}")
+        super().close()
